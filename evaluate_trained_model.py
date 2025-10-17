@@ -39,7 +39,7 @@ from pretrain import (
     create_evaluators,
     evaluate,
     load_checkpoint,
-    TrainState
+    TrainState, EvaluatorConfig
 )
 from utils.functions import load_model_class
 
@@ -90,6 +90,7 @@ def load_config_from_checkpoint(checkpoint_path: Path) -> PretrainConfig:
         raise ValueError(f"No config file found in {checkpoint_dir} or default location")
 
     # Convert to PretrainConfig
+    config_dict["evaluators"] = [EvaluatorConfig(**evaluator) for evaluator in config_dict["evaluators"]]
     config = PretrainConfig(**config_dict)
     return config
 
@@ -133,7 +134,7 @@ def evaluate_checkpoint(
 
     # Apply overrides
     config.checkpoint_path = str(checkpoint_path.parent)
-    config.data_path = data_path
+    config.data_paths = [data_path]
 
     if config_overrides:
         for key, value in config_overrides.items():
@@ -385,12 +386,12 @@ def main():
     config_overrides = {
         "global_batch_size": args.batch_size,
         "evaluators": [
-            {
-                "name": "ARC",
+            EvaluatorConfig(**{
+                "name": "arc@ARC",
                 "submission_K": args.submission_k,
                 "aggregated_voting": args.aggregated_voting,
                 "pass_Ks": [1, 2, 5, 10, 100, 1000]
-            }
+            })
         ]
     }
 
