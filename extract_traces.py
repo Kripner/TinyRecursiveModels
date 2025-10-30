@@ -130,14 +130,12 @@ class SimplePuzzleDataset(IterableDataset):
                 identifier = new_samples["puzzle_identifiers"][i]
                 assert identifier != self.evaluator.blank_identifier_id
                 name = self.evaluator.identifier_map[identifier]
-                orig_name, _inverse_fn = inverse_aug(name)
                 if PuzzleIdSeparator in name:
                     continue
-                assert orig_name not in already_seen
-                already_seen.add(orig_name)
+                already_seen.add(name)
                 for k in new_samples.keys():
                     samples[k].append(new_samples[k][i])
-            if len(samples["puzzle_identifiers"]) == self.config.batch_size:
+            if len(samples["puzzle_identifiers"]) >= self.config.batch_size:
                 yield self._collate_batch(samples)
                 samples = {"inputs": [], "labels": [], "puzzle_identifiers": []}
         if len(samples["puzzle_identifiers"]) != 0:
@@ -209,12 +207,14 @@ class RolloutStep:
 
 @dataclass
 class PuzzleRollout:
+    puzzle_name: str
     puzzle: arc_core.Task
     input: arc_core.Grid
     rollout: list[RolloutStep]
 
     def to_dict(self):
         return {
+            "puzzle_name": self.puzzle_name,
             "puzzle": self.puzzle.to_dict(),
             "input": self.input.to_list(),
             "rollout": [s.to_dict() for s in self.rollout],
@@ -244,7 +244,7 @@ def evaluate(model: nn.Module, eval_loader: torch.utils.data.DataLoader, evaluat
                     [arc_core.Pair(pair["input"], pair["output"]) for pair in puzzle_raw["test"]],
                 )
                 input_grid = arc_core.Grid(_crop(input_))
-                batch_rollouts.append(PuzzleRollout(puzzle, input_grid, rollout=[]))
+                batch_rollouts.append(PuzzleRollout(name, puzzle, input_grid, rollout=[]))
 
             while True:
                 carry, outputs, batch_traces = model(carry=carry, batch=batch)
