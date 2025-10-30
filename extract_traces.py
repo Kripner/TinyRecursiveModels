@@ -36,6 +36,8 @@ class SimplePuzzleDataset(IterableDataset):
 
         self.metadata = self._load_metadata(config.data_path)
 
+        self.evaluator = None  # To be assigned.
+
         # State
         self._data = None
         self._iters = 0
@@ -70,7 +72,7 @@ class SimplePuzzleDataset(IterableDataset):
             }
 
     def _collate_batch(self, batch):
-        batch = {k: v.astype(np.int32) for k, v in batch.items()}
+        batch = {k: np.asarray(v).astype(np.int32) for k, v in batch.items()}
 
         # Convert ignore label IDs
         if self.metadata.ignore_label_id is not None:
@@ -94,16 +96,6 @@ class SimplePuzzleDataset(IterableDataset):
     def _iter_test(self):
         for set_i, (set_name, dataset) in enumerate(self._data.items()):  # type: ignore
             total_examples = len(dataset["inputs"])
-            #
-            #
-            #
-            # batch_samples = []
-            # for i in range(total_examples):
-            #     if len(batch_samples) == self.config.batch_size:
-            #         yield self._collate_batch(batch_samples)
-            #         batch_samples = []
-            # if len(batch_samples) != 0:
-            #     yield self._collate_batch(batch_samples)
 
             # Load examples one by one
             start_index = 0
@@ -119,20 +111,36 @@ class SimplePuzzleDataset(IterableDataset):
                         puzzle_index += 1
                     puzzle_indices.append(puzzle_index)
 
-                batch = self._collate_batch({
+                yield {
                     "inputs": dataset["inputs"][start_index: end_index],
                     "labels": dataset["labels"][start_index: end_index],
                     "puzzle_identifiers": dataset["puzzle_identifiers"][puzzle_indices]
-                })
-
-                yield set_name, batch, end_index - start_index
+                }
 
                 # Advance to next batch
                 start_index += self.config.batch_size
 
     def __iter__(self):
         self._lazy_load_dataset()
-        yield from self._iter_test()
+
+        samples = {"inputs": [], "labels": [], "puzzle_identifiers": []}
+        already_seen = set()
+        for new_samples in self._iter_test():
+            for i in range(len(new_samples["puzzle_identifiers"])):
+                identifier = new_samples["puzzle_identifiers"][i]
+                assert identifier != self.evaluator.blank_identifier_id
+                name = self.evaluator.identifier_map[identifier]
+                orig_name, _inverse_fn = inverse_aug(name)
+                if orig_name in already_seen:
+                    continue
+                already_seen.add(orig_name)
+                for k in new_samples.keys():
+                    samples[k].append(new_samples[k][i])
+            if len(samples["puzzle_identifiers"]) == self.config.batch_size:
+                yield self._collate_batch(samples)
+                samples = {"inputs": [], "labels": [], "puzzle_identifiers": []}
+        if len(samples["puzzle_identifiers"]) != 0:
+            yield self._collate_batch(samples)
 
 
 def create_dataloader(config: PretrainConfig, split: str, batch_size: int):
@@ -182,8 +190,8 @@ class PuzzleRollout:
 
 def evaluate(model: nn.Module, eval_loader: torch.utils.data.DataLoader, evaluator: ARC):
     with torch.inference_mode():
-        for i, (set_name, batch, global_batch_size) in enumerate(eval_loader):
-            print(f"Processing batch {i}: {set_name}")
+        for i, batch in enumerate(eval_loader):
+            print(f"Processing batch {i}")
 
             # To device
             batch = {k: v.cuda() for k, v in batch.items()}
@@ -219,11 +227,10 @@ def evaluate(model: nn.Module, eval_loader: torch.utils.data.DataLoader, evaluat
                     pred_grid = arc_core.Grid(pred)
                     result.rollout.append(pred_grid)
 
-                all_finish = carry.halted.all()
+                all_finish = carry.halted.all()  # At eval, all 16 steps are performed always.
                 if all_finish:
                     break
 
-            breakpoint()
             del carry, outputs, all_finish
 
 
@@ -301,6 +308,8 @@ def evaluate_checkpoint(
     print(f"Dataset has {len(eval_metadata.sets)} test sets")
 
     evaluator = ARC(str(data_path), eval_metadata)
+    train_loader.dataset.evaluator = evaluator
+    eval_loader.dataset.evaluator = evaluator
     evaluate(model, eval_loader, evaluator)
 
 
