@@ -182,9 +182,14 @@ def create_model(config: PretrainConfig, train_metadata: PuzzleDatasetMetadata):
     return model
 
 @dataclass
+class HStep:
+    out_grid: arc_core.Grid
+    L_trace: list[arc_core.Grid]
+
+@dataclass
 class RolloutStep:
     out_grid: arc_core.Grid
-    trace: list[arc_core.Grid]
+    H_trace: list[HStep]
     q_halt_logit: float
     q_continue_logit: float
 
@@ -198,7 +203,7 @@ class PuzzleRollout:
 def evaluate(model: nn.Module, eval_loader: torch.utils.data.DataLoader, evaluator: ARC):
     with torch.inference_mode():
         for batch_idx, batch in enumerate(eval_loader):
-            print(f"Processing batch {batch_idx}")
+            print(f"Processing batch {batch_idx} (size {len(batch["puzzle_identifiers"])})")
 
             # To device
             batch = {k: v.cuda() for k, v in batch.items()}
@@ -220,30 +225,34 @@ def evaluate(model: nn.Module, eval_loader: torch.utils.data.DataLoader, evaluat
                 batch_rollouts.append(PuzzleRollout(puzzle, input_grid, rollout=[]))
 
             while True:
-                carry, outputs, traces_logits = model(carry=carry, batch=batch)
+                carry, outputs, batch_traces = model(carry=carry, batch=batch)
 
                 outputs["preds"] = torch.argmax(outputs["logits"], dim=-1)
                 outputs = {k: outputs[k].detach().cpu() for k in outputs}
 
-                traces = [torch.argmax(t, dim=-1).detach().cpu().numpy() for t in traces_logits]
-
                 for i in range(len(batch_rollouts)):
                     result = batch_rollouts[i]
-                    pred = outputs["preds"][i].numpy()
+                    pred = arc_core.Grid(_crop(outputs["preds"][i].numpy()))
                     q_halt_logit = outputs["q_halt_logits"][i].item()
                     q_continue_logit = outputs["q_continue_logits"][i].item()
-                    trace = [traces[t][i] for t in range(len(traces))]
 
-                    pred = arc_core.Grid(_crop(pred))
-                    trace = [arc_core.Grid(_crop(t)) for t in trace]
+                    logits_to_grid = lambda logits: arc_core.Grid(_crop(torch.argmax(logits, dim=-1).detach().cpu().numpy()))
+                    h_trace = []
+                    for h_idx in range(len(batch_traces)):
+                        h_out_grid = logits_to_grid(batch_traces[h_idx][0][i])
+                        l_trace = [
+                            logits_to_grid(batch_traces[h_idx][1][l_idx][i])
+                            for l_idx in range(len(batch_traces[h_idx][1]))
+                        ]
 
-                    result.rollout.append(RolloutStep(pred, trace, q_halt_logit, q_continue_logit))
+                        h_trace.append(HStep(h_out_grid, l_trace))
+
+                    result.rollout.append(RolloutStep(pred, h_trace, q_halt_logit, q_continue_logit))
 
                 all_finish = carry.halted.all()  # At eval, all 16 steps are performed always.
                 if all_finish:
                     break
 
-            breakpoint()
             del carry, outputs, all_finish
 
 
