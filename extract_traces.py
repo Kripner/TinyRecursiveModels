@@ -186,6 +186,12 @@ class HStep:
     out_grid: arc_core.Grid
     L_trace: list[arc_core.Grid]
 
+    def to_dict(self):
+        return {
+            "out_grid": self.out_grid.to_list(),
+            "L_trace": [g.to_list() for g in self.L_trace],
+        }
+
 @dataclass
 class RolloutStep:
     out_grid: arc_core.Grid
@@ -193,15 +199,31 @@ class RolloutStep:
     q_halt_logit: float
     q_continue_logit: float
 
+    def to_dict(self):
+        return {
+            "out_grid": self.out_grid.to_list(),
+            "H_trace": [s.to_dict() for s in self.H_trace],
+            "q_halt_logit": self.q_halt_logit,
+            "q_continue_logit": self.q_continue_logit,
+        }
+
 @dataclass
 class PuzzleRollout:
     puzzle: arc_core.Task
     input: arc_core.Grid
     rollout: list[RolloutStep]
 
+    def to_dict(self):
+        return {
+            "puzzle": self.puzzle.to_dict(),
+            "input": self.input.to_list(),
+            "rollout": [s.to_dict() for s in self.rollout],
+        }
 
-def evaluate(model: nn.Module, eval_loader: torch.utils.data.DataLoader, evaluator: ARC):
+
+def evaluate(model: nn.Module, eval_loader: torch.utils.data.DataLoader, evaluator: ARC, result_file: Path):
     with torch.inference_mode():
+        rollouts = []
         for batch_idx, batch in enumerate(eval_loader):
             print(f"Processing batch {batch_idx} (size {len(batch["puzzle_identifiers"])})")
 
@@ -253,8 +275,9 @@ def evaluate(model: nn.Module, eval_loader: torch.utils.data.DataLoader, evaluat
                 if all_finish:
                     break
 
-            del carry, outputs, all_finish
-
+            rollouts.extend(batch_rollouts)
+            result_file.write_text("\n".join(json.dumps(r.to_dict()) for r in rollouts))
+            del carry, outputs, all_finish, batch_rollouts, batch_traces
 
 def evaluate_checkpoint(
         checkpoint_path: Path,
@@ -285,8 +308,8 @@ def evaluate_checkpoint(
             else:
                 setattr(config, key, value)
 
-    # Setup output directory
     output_dir.mkdir(parents=True, exist_ok=True)
+    result_file = output_dir / "rollouts.jsonl"
 
     print(f"Loading evaluation dataset from: {data_path}")
     try:
@@ -332,7 +355,7 @@ def evaluate_checkpoint(
     evaluator = ARC(str(data_path), eval_metadata)
     train_loader.dataset.evaluator = evaluator
     eval_loader.dataset.evaluator = evaluator
-    evaluate(model, eval_loader, evaluator)
+    evaluate(model, eval_loader, evaluator, result_file)
 
 
 def main():
