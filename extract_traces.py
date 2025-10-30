@@ -181,18 +181,22 @@ def create_model(config: PretrainConfig, train_metadata: PuzzleDatasetMetadata):
 
     return model
 
+@dataclass
+class RolloutStep:
+    out_grid: arc_core.Grid
+    trace: list[arc_core.Grid]
 
 @dataclass
 class PuzzleRollout:
     puzzle: arc_core.Task
     input: arc_core.Grid
-    rollout: list[arc_core.Grid]
+    rollout: list[RolloutStep]
 
 
 def evaluate(model: nn.Module, eval_loader: torch.utils.data.DataLoader, evaluator: ARC):
     with torch.inference_mode():
-        for i, batch in enumerate(eval_loader):
-            print(f"Processing batch {i}")
+        for batch_idx, batch in enumerate(eval_loader):
+            print(f"Processing batch {batch_idx}")
 
             # To device
             batch = {k: v.cuda() for k, v in batch.items()}
@@ -204,34 +208,38 @@ def evaluate(model: nn.Module, eval_loader: torch.utils.data.DataLoader, evaluat
                                           batch["inputs"].detach().cpu().numpy()):
                 assert identifier != evaluator.blank_identifier_id
                 name = evaluator.identifier_map[identifier]
-                orig_name, _inverse_fn = inverse_aug(name)
 
-                input_raw = _inverse_fn(_crop(input_))
-
-                puzzle_raw = evaluator.test_puzzles[orig_name]
+                puzzle_raw = evaluator.test_puzzles[name]
                 puzzle = arc_core.Task(
                     [arc_core.Pair(pair["input"], pair["output"]) for pair in puzzle_raw["train"]],
                     [arc_core.Pair(pair["input"], pair["output"]) for pair in puzzle_raw["test"]],
                 )
-                input_grid = arc_core.Grid(input_raw)
+                input_grid = arc_core.Grid(_crop(input_))
                 batch_rollouts.append(PuzzleRollout(puzzle, input_grid, rollout=[]))
 
             while True:
-                carry, outputs = model(carry=carry, batch=batch)
+                carry, outputs, traces_logits = model(carry=carry, batch=batch)
+
                 outputs["preds"] = torch.argmax(outputs["logits"], dim=-1)
                 outputs = {k: outputs[k].detach().cpu() for k in outputs}
 
-                for result, pred in zip(batch_rollouts, outputs["preds"].numpy()):
-                    pred = _inverse_fn(_crop(pred))
-                    assert np.all((pred >= 0) & (pred <= 9)), f"Puzzle {name}'s prediction out of 0-9 range."
+                traces = [torch.argmax(t, dim=-1).detach().cpu().numpy() for t in traces_logits]
 
-                    pred_grid = arc_core.Grid(pred)
-                    result.rollout.append(pred_grid)
+                for i in range(len(batch_rollouts)):
+                    result = batch_rollouts[i]
+                    pred = outputs["preds"][i].numpy()
+                    trace = [traces[t][i] for t in range(len(traces))]
+
+                    pred = arc_core.Grid(_crop(pred))
+                    trace = [arc_core.Grid(_crop(t)) for t in trace]
+
+                    result.rollout.append(RolloutStep(pred, trace))
 
                 all_finish = carry.halted.all()  # At eval, all 16 steps are performed always.
                 if all_finish:
                     break
 
+            breakpoint()
             del carry, outputs, all_finish
 
 
