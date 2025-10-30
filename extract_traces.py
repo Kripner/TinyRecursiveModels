@@ -185,6 +185,8 @@ def create_model(config: PretrainConfig, train_metadata: PuzzleDatasetMetadata):
 class RolloutStep:
     out_grid: arc_core.Grid
     trace: list[arc_core.Grid]
+    q_halt_logit: float
+    q_continue_logit: float
 
 @dataclass
 class PuzzleRollout:
@@ -228,12 +230,14 @@ def evaluate(model: nn.Module, eval_loader: torch.utils.data.DataLoader, evaluat
                 for i in range(len(batch_rollouts)):
                     result = batch_rollouts[i]
                     pred = outputs["preds"][i].numpy()
+                    q_halt_logit = outputs["q_halt_logits"][i].item()
+                    q_continue_logit = outputs["q_continue_logits"][i].item()
                     trace = [traces[t][i] for t in range(len(traces))]
 
                     pred = arc_core.Grid(_crop(pred))
                     trace = [arc_core.Grid(_crop(t)) for t in trace]
 
-                    result.rollout.append(RolloutStep(pred, trace))
+                    result.rollout.append(RolloutStep(pred, trace, q_halt_logit, q_continue_logit))
 
                 all_finish = carry.halted.all()  # At eval, all 16 steps are performed always.
                 if all_finish:
