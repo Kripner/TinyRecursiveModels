@@ -18,7 +18,7 @@ from evaluators.arc import ARC, _crop
 from models.losses import IGNORE_LABEL_ID
 from pretrain import PretrainConfig, EvaluatorConfig
 from dataset.common import PuzzleDatasetMetadata
-from dataset.build_arc_dataset import inverse_aug, grid_hash, arc_grid_to_np
+from dataset.build_arc_dataset import inverse_aug, grid_hash, arc_grid_to_np, PuzzleIdSeparator
 from utils.functions import load_model_class
 
 
@@ -131,8 +131,9 @@ class SimplePuzzleDataset(IterableDataset):
                 assert identifier != self.evaluator.blank_identifier_id
                 name = self.evaluator.identifier_map[identifier]
                 orig_name, _inverse_fn = inverse_aug(name)
-                if orig_name in already_seen:
+                if PuzzleIdSeparator in name:
                     continue
+                assert orig_name not in already_seen
                 already_seen.add(orig_name)
                 for k in new_samples.keys():
                     samples[k].append(new_samples[k][i])
