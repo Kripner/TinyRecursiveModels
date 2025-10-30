@@ -1,6 +1,7 @@
 import argparse
 import json
 import os
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional, Any
 
@@ -93,6 +94,16 @@ class SimplePuzzleDataset(IterableDataset):
     def _iter_test(self):
         for set_i, (set_name, dataset) in enumerate(self._data.items()):  # type: ignore
             total_examples = len(dataset["inputs"])
+            #
+            #
+            #
+            # batch_samples = []
+            # for i in range(total_examples):
+            #     if len(batch_samples) == self.config.batch_size:
+            #         yield self._collate_batch(batch_samples)
+            #         batch_samples = []
+            # if len(batch_samples) != 0:
+            #     yield self._collate_batch(batch_samples)
 
             # Load examples one by one
             start_index = 0
@@ -104,8 +115,7 @@ class SimplePuzzleDataset(IterableDataset):
                 puzzle_indices = []
                 puzzle_index = np.searchsorted(dataset["puzzle_indices"], start_index, side="right") - 1
                 for i in range(start_index, end_index):
-                    while puzzle_index + 1 < len(dataset["puzzle_indices"]) and i >= dataset["puzzle_indices"][
-                        puzzle_index + 1]:
+                    while puzzle_index + 1 < len(dataset["puzzle_indices"]) and i >= dataset["puzzle_indices"][puzzle_index + 1]:
                         puzzle_index += 1
                     puzzle_indices.append(puzzle_index)
 
@@ -163,10 +173,15 @@ def create_model(config: PretrainConfig, train_metadata: PuzzleDatasetMetadata):
     return model
 
 
+@dataclass
+class PuzzleRollout:
+    puzzle: arc_core.Task
+    input: arc_core.Grid
+    rollout: list[arc_core.Grid]
+
+
 def evaluate(model: nn.Module, eval_loader: torch.utils.data.DataLoader, evaluator: ARC):
     with torch.inference_mode():
-        carry = None
-
         for i, (set_name, batch, global_batch_size) in enumerate(eval_loader):
             print(f"Processing batch {i}: {set_name}")
 
@@ -175,39 +190,40 @@ def evaluate(model: nn.Module, eval_loader: torch.utils.data.DataLoader, evaluat
             with torch.device("cuda"):
                 carry = model.initial_carry(batch)  # type: ignore
 
+            batch_rollouts = []
+            for identifier, input_ in zip(batch["puzzle_identifiers"].detach().cpu().numpy(),
+                                          batch["inputs"].detach().cpu().numpy()):
+                assert identifier != evaluator.blank_identifier_id
+                name = evaluator.identifier_map[identifier]
+                orig_name, _inverse_fn = inverse_aug(name)
+
+                input_raw = _inverse_fn(_crop(input_))
+
+                puzzle_raw = evaluator.test_puzzles[orig_name]
+                puzzle = arc_core.Task(
+                    [arc_core.Pair(pair["input"], pair["output"]) for pair in puzzle_raw["train"]],
+                    [arc_core.Pair(pair["input"], pair["output"]) for pair in puzzle_raw["test"]],
+                )
+                input_grid = arc_core.Grid(input_raw)
+                batch_rollouts.append(PuzzleRollout(puzzle, input_grid, rollout=[]))
+
             while True:
                 carry, outputs = model(carry=carry, batch=batch)
                 outputs["preds"] = torch.argmax(outputs["logits"], dim=-1)
                 outputs = {k: outputs[k].detach().cpu() for k in outputs}
 
-                for identifier, input_, pred in zip(batch["puzzle_identifiers"].detach().cpu().numpy(),
-                                                    batch["inputs"].detach().cpu().numpy(), outputs["preds"].numpy()):
-                    assert identifier != evaluator.blank_identifier_id
-                    name = evaluator.identifier_map[identifier]
-                    orig_name, _inverse_fn = inverse_aug(name)
-
-                    input_hash = grid_hash(_inverse_fn(_crop(input_)))
-                    input_raw = _inverse_fn(_crop(input_))
-
+                for result, pred in zip(batch_rollouts, outputs["preds"].numpy()):
                     pred = _inverse_fn(_crop(pred))
-                    assert np.all(
-                        (pred >= 0) & (pred <= 9)), f"Puzzle {name}'s prediction out of 0-9 range."  # Sanity check
+                    assert np.all((pred >= 0) & (pred <= 9)), f"Puzzle {name}'s prediction out of 0-9 range."
 
-                    # Store into local state
-                    pred_hash = grid_hash(pred)
-
-                    puzzle_raw = evaluator.test_puzzles[orig_name]
-                    puzzle = arc_core.Task(
-                        [arc_core.Pair(pair["input"], pair["output"]) for pair in puzzle_raw["train"]],
-                        [arc_core.Pair(pair["input"], pair["output"]) for pair in puzzle_raw["test"]],
-                    )
-
-                    breakpoint()
+                    pred_grid = arc_core.Grid(pred)
+                    result.rollout.append(pred_grid)
 
                 all_finish = carry.halted.all()
                 if all_finish:
                     break
 
+            breakpoint()
             del carry, outputs, all_finish
 
 
