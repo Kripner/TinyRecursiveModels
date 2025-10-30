@@ -10,11 +10,14 @@ from torch import nn
 
 import pydantic
 from torch.utils.data import IterableDataset, DataLoader
+import arc_agi_core as arc_core
 
 from evaluate_trained_model import load_config_from_checkpoint
+from evaluators.arc import ARC, _crop
 from models.losses import IGNORE_LABEL_ID
-from dataset.common import PuzzleDatasetMetadata
 from pretrain import PretrainConfig, EvaluatorConfig
+from dataset.common import PuzzleDatasetMetadata
+from dataset.build_arc_dataset import inverse_aug, grid_hash, arc_grid_to_np
 from utils.functions import load_model_class
 
 
@@ -125,7 +128,8 @@ class SimplePuzzleDataset(IterableDataset):
 def create_dataloader(config: PretrainConfig, split: str, batch_size: int):
     dataset = SimplePuzzleDataset(SimplePuzzleDatasetConfig(
         seed=config.seed,
-        data_path=config.data_paths_test[0] if len(config.data_paths_test) > 0 and split == "test" else config.data_paths[0],
+        data_path=config.data_paths_test[0] if len(config.data_paths_test) > 0 and split == "test" else
+        config.data_paths[0],
         batch_size=batch_size,
     ), split=split)
     dataloader = DataLoader(
@@ -159,7 +163,7 @@ def create_model(config: PretrainConfig, train_metadata: PuzzleDatasetMetadata):
     return model
 
 
-def evaluate(model: nn.Module, eval_loader: torch.utils.data.DataLoader):
+def evaluate(model: nn.Module, eval_loader: torch.utils.data.DataLoader, evaluator: ARC):
     with torch.inference_mode():
         carry = None
 
@@ -171,16 +175,38 @@ def evaluate(model: nn.Module, eval_loader: torch.utils.data.DataLoader):
             with torch.device("cuda"):
                 carry = model.initial_carry(batch)  # type: ignore
 
-            inference_steps = 0
             while True:
                 carry, outputs = model(carry=carry, batch=batch)
-                inference_steps += 1
+                outputs["preds"] = torch.argmax(outputs["logits"], dim=-1)
+                outputs = {k: outputs[k].detach().cpu() for k in outputs}
+
+                for identifier, input_, pred in zip(batch["puzzle_identifiers"].detach().cpu().numpy(),
+                                                    batch["inputs"].detach().cpu().numpy(), outputs["preds"].numpy()):
+                    assert identifier != evaluator.blank_identifier_id
+                    name = evaluator.identifier_map[identifier]
+                    orig_name, _inverse_fn = inverse_aug(name)
+
+                    input_hash = grid_hash(_inverse_fn(_crop(input_)))
+                    input_raw = _inverse_fn(_crop(input_))
+
+                    pred = _inverse_fn(_crop(pred))
+                    assert np.all(
+                        (pred >= 0) & (pred <= 9)), f"Puzzle {name}'s prediction out of 0-9 range."  # Sanity check
+
+                    # Store into local state
+                    pred_hash = grid_hash(pred)
+
+                    puzzle_raw = evaluator.test_puzzles[orig_name]
+                    puzzle = arc_core.Task(
+                        [arc_core.Pair(pair["input"], pair["output"]) for pair in puzzle_raw["train"]],
+                        [arc_core.Pair(pair["input"], pair["output"]) for pair in puzzle_raw["test"]],
+                    )
+
+                    breakpoint()
 
                 all_finish = carry.halted.all()
                 if all_finish:
                     break
-
-            print(f"  Completed inference in {inference_steps} steps")
 
             del carry, outputs, all_finish
 
@@ -258,7 +284,8 @@ def evaluate_checkpoint(
     print("Running evaluation...")
     print(f"Dataset has {len(eval_metadata.sets)} test sets")
 
-    evaluate(model, eval_loader)
+    evaluator = ARC(str(data_path), eval_metadata)
+    evaluate(model, eval_loader, evaluator)
 
 
 def main():
@@ -281,10 +308,16 @@ def main():
         default="trm_out",
         help="Directory to save evaluation results"
     )
+    # parser.add_argument(
+    #     "--batch-size",
+    #     type=int,
+    #     default=512,
+    #     help="Global batch size for evaluation"
+    # )
     parser.add_argument(
         "--batch-size",
         type=int,
-        default=512,
+        default=1,
         help="Global batch size for evaluation"
     )
     parser.add_argument(
