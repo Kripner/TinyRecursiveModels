@@ -57,18 +57,13 @@ class SimplePuzzleDataset(IterableDataset):
         # Load data
         self._data = {}
         for set_name in self.metadata.sets:  # Load subset
-            for i, dataset_path in enumerate(self.config.dataset_paths):
-                if i > 0:
-                    set_name_ = set_name + str(i)
-                else:
-                    set_name_ = set_name
-                self._data[set_name_] = {
-                    field_name: np.load(
-                        os.path.join(dataset_path, self.split, f"{set_name}__{field_name}.npy"),
-                        mmap_mode=mmap_mode,
-                    )
-                    for field_name, mmap_mode in field_mmap_modes.items()
-                }
+            self._data[set_name] = {
+                field_name: np.load(
+                    os.path.join(self.config.data_path, self.split, f"{set_name}__{field_name}.npy"),
+                    mmap_mode=mmap_mode,
+                )
+                for field_name, mmap_mode in field_mmap_modes.items()
+            }
 
     def _collate_batch(self, batch):
         batch = {k: v.astype(np.int32) for k, v in batch.items()}
@@ -154,12 +149,12 @@ def create_model(config: PretrainConfig, train_metadata: PuzzleDatasetMetadata):
 
     # Instantiate model with loss head
     model_cls = load_model_class(config.arch.name)
-    loss_head_cls = load_model_class(config.arch.loss.name)
+    # loss_head_cls = load_model_class(config.arch.loss.name)
 
     with torch.device("cuda"):
         model: nn.Module = model_cls(model_cfg)
         print(model)
-        model = loss_head_cls(model, **config.arch.loss.__pydantic_extra__)  # type: ignore
+        # model = loss_head_cls(model, **config.arch.loss.__pydantic_extra__)  # type: ignore
 
     return model
 
@@ -167,10 +162,9 @@ def create_model(config: PretrainConfig, train_metadata: PuzzleDatasetMetadata):
 def evaluate(model: nn.Module, eval_loader: torch.utils.data.DataLoader):
     with torch.inference_mode():
         carry = None
-        processed_batches = 0
 
-        for set_name, batch, global_batch_size in eval_loader:
-            print(f"Processing batch {processed_batches}: {set_name}")
+        for i, (set_name, batch, global_batch_size) in enumerate(eval_loader):
+            print(f"Processing batch {i}: {set_name}")
 
             # To device
             batch = {k: v.cuda() for k, v in batch.items()}
@@ -179,15 +173,16 @@ def evaluate(model: nn.Module, eval_loader: torch.utils.data.DataLoader):
 
             inference_steps = 0
             while True:
-                carry, loss, metrics, preds, all_finish = model(carry=carry, batch=batch)
+                carry, outputs = model(carry=carry, batch=batch)
                 inference_steps += 1
 
+                all_finish = carry.halted.all()
                 if all_finish:
                     break
 
             print(f"  Completed inference in {inference_steps} steps")
 
-            del carry, loss, preds, batch, metrics, all_finish
+            del carry, outputs, all_finish
 
 
 def evaluate_checkpoint(
@@ -253,6 +248,10 @@ def evaluate_checkpoint(
         state_dict = checkpoint["state_dict"]
     else:
         state_dict = checkpoint
+    state_dict = {
+        (k if not k.startswith("_orig_mod.model.") else k[len("_orig_mod.model."):]): v
+        for k, v in state_dict.items()
+    }
     model.load_state_dict(state_dict, strict=True)
     model.eval()
 
