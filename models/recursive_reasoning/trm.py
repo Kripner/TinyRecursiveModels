@@ -25,7 +25,8 @@ class TinyRecursiveReasoningModel_ACTV1Carry:
     
     steps: torch.Tensor
     halted: torch.Tensor
-    
+    inject_noise: torch.Tensor
+
     current_data: Dict[str, torch.Tensor]
 
 
@@ -193,7 +194,8 @@ class TinyRecursiveReasoningModel_ACTV1_Inner(nn.Module):
             z_L=torch.where(reset_flag.view(-1, 1, 1), self.L_init, carry.z_L),
         )
 
-    def forward(self, carry: TinyRecursiveReasoningModel_ACTV1InnerCarry, batch: Dict[str, torch.Tensor]) -> Tuple[TinyRecursiveReasoningModel_ACTV1InnerCarry, torch.Tensor, Tuple[torch.Tensor, torch.Tensor], list[tuple[torch.Tensor, list[torch.Tensor]]]]:
+    def forward(self, carry: TinyRecursiveReasoningModel_ACTV1InnerCarry, batch: Dict[str, torch.Tensor]) -> Tuple[TinyRecursiveReasoningModel_ACTV1InnerCarry, torch.Tensor, Tuple[torch.Tensor, torch.Tensor], list[tuple[torch.Tensor, list[torch.Tensor], torch.Tensor]]]:
+        do_trace = True
         seq_info = dict(
             cos_sin=self.rotary_emb() if hasattr(self, "rotary_emb") else None,
         )
@@ -202,7 +204,6 @@ class TinyRecursiveReasoningModel_ACTV1_Inner(nn.Module):
         input_embeddings = self._input_embeddings(batch["inputs"], batch["puzzle_identifiers"])
 
         # Forward iterations
-        it = 0
         z_H, z_L = carry.z_H, carry.z_L
         H_trace = []
         # H_cycles-1 without grad
@@ -211,20 +212,34 @@ class TinyRecursiveReasoningModel_ACTV1_Inner(nn.Module):
                 L_trace = []
                 for _L_step in range(self.config.L_cycles):
                     z_L = self.L_level(z_L, z_H + input_embeddings, **seq_info)
-                    z_H_probe = self.L_level(z_H, z_L, **seq_info)
-                    L_trace.append(self.lm_head(z_H_probe)[:, self.puzzle_emb_len:])
-                z_H = self.L_level(z_H, z_L, **seq_info)
-                output_probe = self.lm_head(z_H)[:, self.puzzle_emb_len:]
-                H_trace.append((output_probe, L_trace))
+                    if do_trace:
+                        z_H_probe = self.L_level(z_H, z_L, **seq_info)
+                        L_trace.append(self.lm_head(z_H_probe)[:, self.puzzle_emb_len:])
+                z_H_new = self.L_level(z_H, z_L, **seq_info)
+                # H_dist1 = torch.linalg.norm(z_H - z_H_new, dim=(1, 2), dtype=torch.float64)
+                H_dist = 1 - F.cosine_similarity(z_H.view(z_H.size(0), -1), z_H_new.view(z_H_new.size(0), -1), dim=1)
+                # H_norm = torch.linalg.norm(z_H_new, dim=(1, 2), dtype=torch.float64)
+                # print("\t|\t".join(f"{y:7}, {x:7}, {z:7}" for x,y,z in zip(H_dist1.detach().cpu().tolist(), H_dist2.detach().cpu().tolist(), H_norm.detach().cpu().tolist())))
+                z_H = z_H_new
+                if do_trace:
+                    output_probe = self.lm_head(z_H)[:, self.puzzle_emb_len:]
+                    H_trace.append((output_probe, L_trace, H_dist))
         # 1 with grad
         L_trace = []
         for _L_step in range(self.config.L_cycles):
             z_L = self.L_level(z_L, z_H + input_embeddings, **seq_info)
-            z_H_probe = self.L_level(z_H, z_L, **seq_info)
-            L_trace.append(self.lm_head(z_H_probe)[:, self.puzzle_emb_len:])
-        z_H = self.L_level(z_H, z_L, **seq_info)
+            if do_trace:
+                z_H_probe = self.L_level(z_H, z_L, **seq_info)
+                L_trace.append(self.lm_head(z_H_probe)[:, self.puzzle_emb_len:])
+        z_H_new = self.L_level(z_H, z_L, **seq_info)
+        # H_dist1 = torch.linalg.norm(z_H - z_H_new, dim=(1, 2), dtype=torch.float64)
+        H_dist = 1 - F.cosine_similarity(z_H.view(z_H.size(0), -1), z_H_new.view(z_H_new.size(0), -1), dim=1)
+        # H_norm = torch.linalg.norm(z_H_new, dim=(1, 2), dtype=torch.float64)
+        # print("\t|\t".join(f"{y:7}, {x:7}, {z:7}" for x,y,z in zip(H_dist1.detach().cpu().tolist(), H_dist2.detach().cpu().tolist(), H_norm.detach().cpu().tolist())))
+        z_H = z_H_new
         output = self.lm_head(z_H)[:, self.puzzle_emb_len:]
-        H_trace.append((output, L_trace))
+        if do_trace:
+            H_trace.append((output, L_trace, H_dist))
 
         # LM Outputs
         new_carry = TinyRecursiveReasoningModel_ACTV1InnerCarry(z_H=z_H.detach(), z_L=z_L.detach())  # New carry no grad
@@ -252,7 +267,8 @@ class TinyRecursiveReasoningModel_ACTV1(nn.Module):
             
             steps=torch.zeros((batch_size, ), dtype=torch.int32),
             halted=torch.ones((batch_size, ), dtype=torch.bool),  # Default to halted
-            
+            inject_noise=torch.zeros((batch_size,), dtype=torch.bool),
+
             current_data={k: torch.empty_like(v) for k, v in batch.items()}
         )
         
@@ -260,7 +276,18 @@ class TinyRecursiveReasoningModel_ACTV1(nn.Module):
 
         # Update data, carry (removing halted sequences)
         new_inner_carry = self.inner.reset_carry(carry.halted, carry.inner_carry)
-        
+
+        # Inject noise if requested.
+        # z_H = new_inner_carry.z_H
+        # new_inner_carry = TinyRecursiveReasoningModel_ACTV1InnerCarry(
+        #     z_H=torch.where(
+        #         carry.inject_noise.view(-1, 1, 1),
+        #         z_H + 10.0 * torch.randn_like(z_H, device=z_H.device),
+        #         z_H,
+        #     ),
+        #     z_L=new_inner_carry.z_L,
+        # )
+
         new_steps = torch.where(carry.halted, 0, carry.steps)
 
         new_current_data = {k: torch.where(carry.halted.view((-1, ) + (1, ) * (batch[k].ndim - 1)), batch[k], v) for k, v in carry.current_data.items()}
@@ -282,26 +309,29 @@ class TinyRecursiveReasoningModel_ACTV1(nn.Module):
             halted = is_last_step
 
             # if training, and ACT is enabled
-            if self.training and (self.config.halt_max_steps > 1):
+            if self.config.halt_max_steps > 1:
+                if self.training:
+                    # Halt signal
+                    # NOTE: During evaluation, always use max steps, this is to guarantee the same halting steps inside a batch for batching purposes
 
-                # Halt signal
-                # NOTE: During evaluation, always use max steps, this is to guarantee the same halting steps inside a batch for batching purposes
-                
-                if self.config.no_ACT_continue:
-                    halted = halted | (q_halt_logits > 0)
-                else:
-                    halted = halted | (q_halt_logits > q_continue_logits)
+                    if self.config.no_ACT_continue:
+                        halted = halted | (q_halt_logits > 0)
+                    else:
+                        halted = halted | (q_halt_logits > q_continue_logits)
 
-                # Exploration
-                min_halt_steps = (torch.rand_like(q_halt_logits) < self.config.halt_exploration_prob) * torch.randint_like(new_steps, low=2, high=self.config.halt_max_steps + 1)
-                halted = halted & (new_steps >= min_halt_steps)
+                    # Exploration
+                    min_halt_steps = (torch.rand_like(q_halt_logits) < self.config.halt_exploration_prob) * torch.randint_like(new_steps, low=2, high=self.config.halt_max_steps + 1)
+                    halted = halted & (new_steps >= min_halt_steps)
 
-                if not self.config.no_ACT_continue:
-                    # Compute target Q
-                    # NOTE: No replay buffer and target networks for computing target Q-value.
-                    # As batch_size is large, there're many parallel envs.
-                    # Similar concept as PQN https://arxiv.org/abs/2407.04811
-                    _, _, (next_q_halt_logits, next_q_continue_logits), _, _ = self.inner(new_inner_carry, new_current_data)
-                    outputs["target_q_continue"] = torch.sigmoid(torch.where(is_last_step, next_q_halt_logits, torch.maximum(next_q_halt_logits, next_q_continue_logits)))
+                    if not self.config.no_ACT_continue:
+                        # Compute target Q
+                        # NOTE: No replay buffer and target networks for computing target Q-value.
+                        # As batch_size is large, there're many parallel envs.
+                        # Similar concept as PQN https://arxiv.org/abs/2407.04811
+                        _, _, (next_q_halt_logits, next_q_continue_logits), _, _ = self.inner(new_inner_carry, new_current_data)
+                        outputs["target_q_continue"] = torch.sigmoid(torch.where(is_last_step, next_q_halt_logits, torch.maximum(next_q_halt_logits, next_q_continue_logits)))
 
-        return TinyRecursiveReasoningModel_ACTV1Carry(new_inner_carry, new_steps, halted, new_current_data), outputs, H_trace
+            # inject_noise = new_steps == 5
+
+
+        return TinyRecursiveReasoningModel_ACTV1Carry(new_inner_carry, new_steps, halted, carry.inject_noise, new_current_data), outputs, H_trace

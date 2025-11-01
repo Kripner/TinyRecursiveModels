@@ -183,11 +183,13 @@ def create_model(config: PretrainConfig, train_metadata: PuzzleDatasetMetadata):
 class HStep:
     out_grid: arc_core.Grid
     L_trace: list[arc_core.Grid]
+    h_dist: float
 
     def to_dict(self):
         return {
             "out_grid": self.out_grid.to_list(),
             "L_trace": [g.to_list() for g in self.L_trace],
+            "h_dist": self.h_dist,
         }
 
 @dataclass
@@ -235,7 +237,9 @@ def evaluate(model: nn.Module, eval_loader: torch.utils.data.DataLoader, evaluat
             batch_rollouts = []
             for identifier, input_ in zip(batch["puzzle_identifiers"].detach().cpu().numpy(),
                                           batch["inputs"].detach().cpu().numpy()):
-                assert identifier != evaluator.blank_identifier_id
+                if identifier == evaluator.blank_identifier_id:
+                    # End of batch.
+                    break
                 name = evaluator.identifier_map[identifier]
 
                 puzzle_raw = evaluator.test_puzzles[name]
@@ -246,7 +250,7 @@ def evaluate(model: nn.Module, eval_loader: torch.utils.data.DataLoader, evaluat
                 input_grid = arc_core.Grid(_crop(input_))
                 batch_rollouts.append(PuzzleRollout(name, puzzle, input_grid, rollout=[]))
 
-            while True:
+            for _ in range(model.config.halt_max_steps):
                 carry, outputs, batch_traces = model(carry=carry, batch=batch)
 
                 outputs["preds"] = torch.argmax(outputs["logits"], dim=-1)
@@ -266,8 +270,9 @@ def evaluate(model: nn.Module, eval_loader: torch.utils.data.DataLoader, evaluat
                             logits_to_grid(batch_traces[h_idx][1][l_idx][i])
                             for l_idx in range(len(batch_traces[h_idx][1]))
                         ]
+                        h_dist = batch_traces[h_idx][2][i].item()
 
-                        h_trace.append(HStep(h_out_grid, l_trace))
+                        h_trace.append(HStep(h_out_grid, l_trace, h_dist))
 
                     result.rollout.append(RolloutStep(pred, h_trace, q_halt_logit, q_continue_logit))
 
@@ -402,8 +407,15 @@ def main():
         default=True,
         help="Use aggregated voting across augmentations"
     )
+    parser.add_argument(
+        "--seed",
+        type=int,
+        default=0,
+    )
 
     args = parser.parse_args()
+
+    torch.manual_seed(args.seed)
 
     # Config overrides
     config_overrides = {
