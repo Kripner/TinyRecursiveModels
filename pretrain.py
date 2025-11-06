@@ -10,6 +10,7 @@ import torch
 import torch.distributed as dist
 from torch import nn
 from torch.utils.data import DataLoader
+from torch.profiler import profile, record_function, ProfilerActivity
 
 import tqdm
 import wandb
@@ -84,6 +85,11 @@ class PretrainConfig(pydantic.BaseModel):
     ema: bool = False # use Exponential-Moving-Average
     ema_rate: float = 0.999 # EMA-rate
     freeze_weights: bool = False # If True, freeze weights and only learn the embeddings
+    
+    # Profiling
+    profile: bool = False
+    profile_steps: int = 10 # number of steps to profile
+    profile_log_dir: Optional[str] = None # Directory for profiler logs (defaults to checkpoint_path/profiler_logs)
 
 @dataclass
 class TrainState:
@@ -294,34 +300,41 @@ def train_batch(config: PretrainConfig, train_state: TrainState, batch: Any, glo
         return
 
     # To device
-    batch = {k: v.cuda() for k, v in batch.items()}
+    with record_function("dataload_to_device"):
+        batch = {k: v.cuda() for k, v in batch.items()}
 
     # Init carry if it is None
     if train_state.carry is None:
         with torch.device("cuda"):
-            train_state.carry = train_state.model.initial_carry(batch)  # type: ignore
+            with record_function("initial_carry"):
+                train_state.carry = train_state.model.initial_carry(batch)  # type: ignore
 
     # Forward
-    train_state.carry, loss, metrics, _, _ = train_state.model(carry=train_state.carry, batch=batch, return_keys=[])
+    with record_function("forward"):
+        train_state.carry, loss, metrics, _, _ = train_state.model(carry=train_state.carry, batch=batch, return_keys=[])
 
-    ((1 / global_batch_size) * loss).backward()
+    # Backward
+    with record_function("backward"):
+        ((1 / global_batch_size) * loss).backward()
 
     # Allreduce
     if world_size > 1:
-        for param in train_state.model.parameters():
-            if param.grad is not None:
-                dist.all_reduce(param.grad)
+        with record_function("allreduce_gradients"):
+            for param in train_state.model.parameters():
+                if param.grad is not None:
+                    dist.all_reduce(param.grad)
             
     # Apply optimizer
-    lr_this_step = None    
-    for optim, base_lr in zip(train_state.optimizers, train_state.optimizer_lrs):
-        lr_this_step = compute_lr(base_lr, config, train_state)
+    lr_this_step = None
+    with record_function("optimizers_step"):
+        for optim, base_lr in zip(train_state.optimizers, train_state.optimizer_lrs):
+            lr_this_step = compute_lr(base_lr, config, train_state)
 
-        for param_group in optim.param_groups:
-            param_group['lr'] = lr_this_step
-            
-        optim.step()
-        optim.zero_grad()
+            for param_group in optim.param_groups:
+                param_group['lr'] = lr_this_step
+                
+            optim.step()
+            optim.zero_grad()
 
     # Reduce metrics
     if len(metrics):
@@ -549,7 +562,7 @@ def launch(hydra_config: DictConfig):
         WORLD_SIZE = dist.get_world_size()
 
         torch.cuda.set_device(int(os.environ["LOCAL_RANK"]))
-
+        
         # CPU GLOO process group
         CPU_PROCESS_GROUP = dist.new_group(backend="gloo")
         assert (
@@ -597,22 +610,66 @@ def launch(hydra_config: DictConfig):
         ema_helper = EMAHelper(mu=config.ema_rate)
         ema_helper.register(train_state.model)
 
+    # Setup profiler (only on rank 0)
+    profiler = None
+    profile_log_dir = None
+    if config.profile and RANK == 0:
+        if config.profile_log_dir is None:
+            if config.checkpoint_path is not None:
+                profile_log_dir = os.path.join(config.checkpoint_path, "profiler_logs")
+            else:
+                profile_log_dir = "profiler_logs"
+        else:
+            profile_log_dir = config.profile_log_dir
+        os.makedirs(profile_log_dir, exist_ok=True)
+        
+        schedule = torch.profiler.schedule(
+            wait=1,    # skip first step
+            warmup=1,  # warmup steps: collect but don't report
+            active=config.profile_steps,  # active profiling steps
+            repeat=1
+        )
+        
+        activities = [ProfilerActivity.CPU, ProfilerActivity.CUDA]
+        
+        profiler = profile(
+            activities=activities,
+            schedule=schedule,
+            on_trace_ready=torch.profiler.tensorboard_trace_handler(profile_log_dir, worker_name="worker0"),
+            record_shapes=True,
+            profile_memory=True,
+            with_stack=True,
+            with_modules=True,
+        )
+        profiler.__enter__()
+        print(f"[Rank {RANK}]: Profiler enabled. Logs will be saved to {profile_log_dir}")
+
     # Training Loop
-    for _iter_id in range(total_iters):
-        print (f"[Rank {RANK}, World Size {WORLD_SIZE}]: Epoch {_iter_id * train_epochs_per_iter}")
+    try:
+        for _iter_id in range(total_iters):
+            print (f"[Rank {RANK}, World Size {WORLD_SIZE}]: Epoch {_iter_id * train_epochs_per_iter}")
 
-        ############ Train Iter
-        if RANK == 0:
-            print("TRAIN")
-        train_state.model.train()
-        for set_name, batch, global_batch_size in train_loader:
-            metrics = train_batch(config, train_state, batch, global_batch_size, rank=RANK, world_size=WORLD_SIZE)
+            ############ Train Iter
+            if RANK == 0:
+                print("TRAIN")
+            train_state.model.train()
+            for set_name, batch, global_batch_size in train_loader:
+                metrics = train_batch(config, train_state, batch, global_batch_size, rank=RANK, world_size=WORLD_SIZE)
 
-            if RANK == 0 and metrics is not None:
-                wandb.log(metrics, step=train_state.step)
-                progress_bar.update(train_state.step - progress_bar.n)  # type: ignore
-            if config.ema:
-                ema_helper.update(train_state.model)
+                if profiler is not None:
+                    profiler.step()
+
+                if RANK == 0 and metrics is not None:
+                    wandb.log(metrics, step=train_state.step)
+                    progress_bar.update(train_state.step - progress_bar.n)  # type: ignore
+                if config.ema:
+                    ema_helper.update(train_state.model)
+                
+                if profiler is not None and train_state.step >= config.profile_steps + 2:  # +2 for wait+warmup
+                    profiler.__exit__(None, None, None)
+                    profiler = None
+                    if RANK == 0:
+                        print(f"[Rank {RANK}]: Profiling completed. View results with: tensorboard --logdir {profile_log_dir}")
 
         if _iter_id >= config.min_eval_interval:
             ############ Evaluation
@@ -645,6 +702,13 @@ def launch(hydra_config: DictConfig):
 
             if config.ema:
                 del train_state_eval
+    
+    finally:
+        # Cleanup profiler if still active
+        if profiler is not None and profile_log_dir is not None:
+            profiler.__exit__(None, None, None)
+            if RANK == 0:
+                print(f"[Rank {RANK}]: Profiling completed. View results with: tensorboard --logdir {profile_log_dir}")
 
     # finalize
     if dist.is_initialized():
