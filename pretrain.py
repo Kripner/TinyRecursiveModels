@@ -671,37 +671,37 @@ def launch(hydra_config: DictConfig):
                     if RANK == 0:
                         print(f"[Rank {RANK}]: Profiling completed. View results with: tensorboard --logdir {profile_log_dir}")
 
-        if _iter_id >= config.min_eval_interval:
-            ############ Evaluation
-            if RANK == 0:
-                print("EVALUATE")
-            if config.ema:
-                print("SWITCH TO EMA")
-                train_state_eval = copy.deepcopy(train_state)
-                train_state_eval.model = ema_helper.ema_copy(train_state_eval.model)
-            else:
-                train_state_eval = train_state
-            train_state_eval.model.eval()
-            metrics = evaluate(config, 
-                train_state_eval, 
-                eval_loader, 
-                eval_metadata, 
-                evaluators,
-                rank=RANK, 
-                world_size=WORLD_SIZE,
-                cpu_group=CPU_PROCESS_GROUP)
+            if _iter_id >= config.min_eval_interval:
+                ############ Evaluation
+                if RANK == 0:
+                    print("EVALUATE")
+                if config.ema:
+                    print("SWITCH TO EMA")
+                    train_state_eval = copy.deepcopy(train_state)
+                    train_state_eval.model = ema_helper.ema_copy(train_state_eval.model)
+                else:
+                    train_state_eval = train_state
+                train_state_eval.model.eval()
+                metrics = evaluate(config,
+                    train_state_eval,
+                    eval_loader,
+                    eval_metadata,
+                    evaluators,
+                    rank=RANK,
+                    world_size=WORLD_SIZE,
+                    cpu_group=CPU_PROCESS_GROUP)
 
-            if RANK == 0 and metrics is not None:
-                wandb.log(metrics, step=train_state.step)
-                
-            ############ Checkpointing
-            if RANK == 0:
-                print("SAVE CHECKPOINT")
-            if RANK == 0 and (config.checkpoint_every_eval or (_iter_id == total_iters - 1)):
-                save_train_state(config, train_state_eval)
+                if RANK == 0 and metrics is not None:
+                    wandb.log(metrics, step=train_state.step)
 
-            if config.ema:
-                del train_state_eval
+                ############ Checkpointing
+                if RANK == 0:
+                    print("SAVE CHECKPOINT")
+                if RANK == 0 and (config.checkpoint_every_eval or (_iter_id == total_iters - 1)):
+                    save_train_state(config, train_state_eval)
+
+                if config.ema:
+                    del train_state_eval
     
     finally:
         # Cleanup profiler if still active
